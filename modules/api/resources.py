@@ -1,6 +1,8 @@
 """
 API endpoints module for CertMate
 Defines Flask-RESTX Resource classes for REST API endpoints
+2026-05-08 - Changes add a ?file=['fullchain.pem', 'privkey.pem', 'combined.pem'] URL parameter that allows you to grab a specific file via the API rather than just a ZIP of everything.
+             Allows a 'dumber' program to retrieve a ready-to-go certificate file with zero processing on the client side.
 """
 
 import logging
@@ -8,8 +10,10 @@ import re
 import tempfile
 import zipfile
 import os
+import io
 from pathlib import Path
-from flask import send_file, after_this_request, current_app
+""" Added request below for URL parameters """
+from flask import send_file, after_this_request, current_app, request
 from flask_restx import Resource, fields
 
 from ..core.metrics import get_metrics_summary, is_prometheus_available
@@ -64,33 +68,21 @@ def create_api_resources(api, models, managers):
     file_ops = managers['file_ops']
     cache_manager = managers['cache']
     dns_manager = managers['dns']
-    deploy_manager = managers.get('deployer')
 
     # Health check endpoint
     class HealthCheck(Resource):
         def get(self):
-            """Health check: settings readable + background scheduler running."""
-            checks = {}
-            overall = 'healthy'
+            """Health check endpoint"""
             try:
+                # Basic health checks
                 settings_manager.load_settings()
-                checks['settings'] = 'ok'
+
+                return {
+                    'status': 'healthy'
+                }
             except Exception as e:
-                logger.error(f"Health check failed (settings): {e}")
-                checks['settings'] = 'error'
-                overall = 'unhealthy'
-
-            scheduler = managers.get('scheduler')
-            scheduler_running = bool(scheduler and getattr(scheduler, 'running', False))
-            checks['scheduler'] = 'running' if scheduler_running else 'not_running'
-            if not scheduler_running:
-                # The scheduler being down means renewals stop firing — surface it
-                # as 'degraded' so monitoring catches it without flapping liveness.
-                if overall == 'healthy':
-                    overall = 'degraded'
-
-            status_code = 200 if overall != 'unhealthy' else 500
-            return {'status': overall, 'checks': checks}, status_code
+                logger.error(f"Health check failed: {e}")
+                return {'status': 'unhealthy'}, 500
 
     # Metrics endpoints
     class MetricsList(Resource):
@@ -145,10 +137,8 @@ def create_api_resources(api, models, managers):
                     if field not in new_settings:
                         return {'error': f'Missing required field: {field}'}, 400
 
-                # Use atomic_update so concurrent writes from the web UI cannot
-                # race, and so users/api_keys are preserved (the API payload
-                # rarely contains them).
-                success = settings_manager.atomic_update(new_settings)
+                # Save settings
+                success = settings_manager.save_settings(new_settings, "api_update")
 
                 if success:
                     return {'message': 'Settings updated successfully'}, 200
@@ -219,24 +209,19 @@ def create_api_resources(api, models, managers):
                 settings = settings_manager.load_settings()
                 certificates = []
 
-                # Map domain -> per-cert auto_renew flag (default True). Domains
-                # that exist only on disk and are not in settings get True too.
-                auto_renew_by_domain = {}
+                # Create a set of all domains to check (from settings and disk)
                 all_domains = set()
 
                 # Add domains from settings
                 for domain_entry in settings.get('domains', []):
                     if isinstance(domain_entry, str):
                         domain = domain_entry
-                        per_cert_auto_renew = True
                     elif isinstance(domain_entry, dict):
                         domain = domain_entry.get('domain')
-                        per_cert_auto_renew = domain_entry.get('auto_renew', True)
                     else:
                         continue
                     if domain:
                         all_domains.add(domain)
-                        auto_renew_by_domain[domain] = bool(per_cert_auto_renew)
 
                 # Also check for certificates that exist on disk but might not be in settings.
                 # Use iter_cert_domain_dirs so FS artifacts (lost+found, hidden dirs,
@@ -250,7 +235,6 @@ def create_api_resources(api, models, managers):
                     if domain:
                         cert_info = certificate_manager.get_certificate_info(domain)
                         if cert_info:
-                            cert_info['auto_renew'] = auto_renew_by_domain.get(domain, True)
                             certificates.append(cert_info)
 
                 return certificates
@@ -357,28 +341,23 @@ def create_api_resources(api, models, managers):
                     challenge_type=challenge_type
                 )
 
-                # Append the new domain to settings under the manager's
-                # lock so two parallel cert creations for different domains
-                # cannot race and silently drop one of the entries.
-                _resolved_dns_provider = dns_provider or settings.get('dns_provider')
-
-                def _add_domain(s):
-                    domains_list = s.get('domains', []) or []
-                    already_present = any(
-                        (d == domain if isinstance(d, str) else d.get('domain') == domain)
-                        for d in domains_list
-                    )
-                    if already_present:
-                        return
-                    domains_list.append({
+                # Ensure domain is in settings for proper listing
+                domains_list = settings.get('domains', [])
+                domain_exists = any(
+                    (d == domain if isinstance(d, str) else d.get('domain') == domain)
+                    for d in domains_list
+                )
+                if not domain_exists:
+                    # Add domain with its configuration
+                    domain_config = {
                         'domain': domain,
-                        'dns_provider': _resolved_dns_provider,
-                        'dns_account_id': account_id,
-                    })
-                    s['domains'] = domains_list
-
-                settings_manager.update(_add_domain, "certificate_created")
-                logger.info(f"Ensured domain {domain} is in settings after certificate creation")
+                        'dns_provider': dns_provider or settings.get('dns_provider'),
+                        'dns_account_id': account_id
+                    }
+                    domains_list.append(domain_config)
+                    settings['domains'] = domains_list
+                    settings_manager.save_settings(settings, "certificate_created")
+                    logger.info(f"Added domain {domain} to settings after certificate creation")
 
                 event_bus = current_app.config.get('EVENT_BUS')
                 if event_bus:
@@ -430,57 +409,11 @@ def create_api_resources(api, models, managers):
                     'hint': 'Check application logs for detailed error information.'
                 }, 500
 
-    class CertificateDetail(Resource):
-        @api.doc(security='Bearer')
-        @auth_manager.require_role('admin')
-        def delete(self, domain):
-            """Delete a certificate's files from disk.
-
-            Refuses if a create or renew is currently holding the domain lock.
-            Does NOT revoke the certificate at the CA — call the CA's revoke
-            endpoint separately if revocation is required.
-            """
-            # Path is only validated for the side-effect of rejecting
-            # traversal attempts; the actual delete is keyed on the domain
-            # name and handled by certificate_manager.
-            _, err = _validate_domain_path(domain, file_ops.cert_dir)
-            if err:
-                return {'error': err}, 400
-            try:
-                deleted = certificate_manager.delete_certificate(domain)
-                if not deleted:
-                    return {'error': f'Certificate not found for domain: {domain}'}, 404
-
-                # Best-effort: drop the domain from settings so the dashboard
-                # stops listing it.
-                try:
-                    settings = settings_manager.load_settings()
-                    domains = settings.get('domains', []) or []
-                    new_domains = [
-                        d for d in domains
-                        if (isinstance(d, str) and d != domain)
-                        or (isinstance(d, dict) and d.get('domain') != domain)
-                    ]
-                    if len(new_domains) != len(domains):
-                        settings_manager.atomic_update({'domains': new_domains})
-                except Exception as e:
-                    logger.warning(f"Removed cert for {domain} but failed to update settings: {e}")
-
-                event_bus = current_app.config.get('EVENT_BUS')
-                if event_bus:
-                    event_bus.publish('certificate_deleted', {'domain': domain})
-                return {'message': f'Certificate deleted for {domain}', 'domain': domain}, 200
-            except RuntimeError as e:
-                return {'error': str(e)}, 409
-            except Exception as e:
-                logger.error(f"Certificate deletion failed for {domain}: {e}")
-                return {'error': 'Certificate deletion failed'}, 500
-
     class DownloadCertificate(Resource):
         @api.doc(security='Bearer')
         @auth_manager.require_role('viewer')
         def get(self, domain):
-            """Download certificate files as ZIP"""
+            """Download certificate files as ZIP or individual file"""
             try:
                 cert_dir, err = _validate_domain_path(domain, file_ops.cert_dir)
                 if err:
@@ -488,7 +421,42 @@ def create_api_resources(api, models, managers):
                 if not cert_dir.exists():
                     return {'error': f'Certificate not found for domain: {domain}'}, 404
 
-                # Create temporary ZIP file
+                # Check for the optional 'file' parameter
+                requested_file = request.args.get('file')
+
+                if requested_file:
+                    # Security check: only allow specific certificate files
+                    if requested_file not in ['fullchain.pem', 'privkey.pem', 'combined.pem']:
+                        return {'error': 'Invalid file requested.'}, 400
+
+                    if requested_file == 'combined.pem':
+                        try:
+                            # Read both files and join them
+                            fullchain = (cert_dir / 'fullchain.pem').read_text()
+                            privkey = (cert_dir / 'privkey.pem').read_text()
+                            combined_data = io.BytesIO(f"{fullchain}{privkey}".encode())
+
+                            return send_file(
+                                combined_data,
+                                as_attachment=True,
+                                download_name=f'{domain}_combined.pem',
+                                mimetype='application/x-pem-file'
+                            )
+                        except FileNotFoundError:
+                            return {'error': f'Required cert files not found for domain {domain}'}, 404
+
+                    file_path = cert_dir / requested_file
+                    if not file_path.exists():
+                        return {'error': f'File {requested_file} not found for domain {domain}'}, 404
+
+                    return send_file(
+                        file_path,
+                        as_attachment=True,
+                        download_name=f'{domain}_{requested_file}',
+                        mimetype='application/x-pem-file'
+                    )
+
+                # Fallback to original ZIP logic if no file parameter is provided
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_file:
                     tmp_path = tmp_file.name
                     with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -541,86 +509,6 @@ def create_api_resources(api, models, managers):
                 if event_bus:
                     event_bus.publish('certificate_failed', {'domain': domain, 'error': str(e)})
                 return {'error': 'Certificate renewal failed'}, 500
-
-    class CertificateAutoRenew(Resource):
-        @api.doc(security='Bearer')
-        @auth_manager.require_role('operator')
-        def put(self, domain):
-            """Enable or disable automatic renewal for a single certificate (issue #111).
-
-            Body: {"enabled": true|false}
-            """
-            _, err = _validate_domain_path(domain, file_ops.cert_dir)
-            if err:
-                return {'error': err}, 400
-            try:
-                data = api.payload or {}
-                if 'enabled' not in data:
-                    return {'error': 'Missing "enabled" boolean in request body'}, 400
-                enabled = bool(data.get('enabled'))
-
-                updated = certificate_manager.set_auto_renew(domain, enabled)
-                if not updated:
-                    return {
-                        'error': f'Domain {domain} not found in settings',
-                        'hint': 'Only domains tracked in settings can have auto-renew toggled.'
-                    }, 404
-
-                event_bus = current_app.config.get('EVENT_BUS')
-                if event_bus:
-                    event_bus.publish('certificate_auto_renew_changed', {
-                        'domain': domain,
-                        'enabled': enabled,
-                    })
-
-                return {
-                    'message': f'Auto-renew {"enabled" if enabled else "disabled"} for {domain}',
-                    'domain': domain,
-                    'auto_renew': enabled,
-                }, 200
-            except Exception as e:
-                logger.error(f"Failed to toggle auto-renew for {domain}: {e}")
-                return {'error': 'Failed to update auto-renew setting'}, 500
-
-    class CertificateRunDeploy(Resource):
-        @api.doc(security='Bearer')
-        @auth_manager.require_role('admin')
-        def post(self, domain):
-            """Manually run all enabled deploy hooks for a domain (issue #109).
-
-            Aligns with the role of /api/deploy/* (admin-only). Hooks run
-            with CERTMATE_EVENT=manual; the on_events filter is ignored
-            since the user explicitly requested execution.
-            """
-            if deploy_manager is None:
-                return {'error': 'Deploy manager not available'}, 503
-
-            cert_dir, err = _validate_domain_path(domain, file_ops.cert_dir)
-            if err:
-                return {'error': err}, 400
-            if not cert_dir.exists():
-                return {'error': f'Certificate not found for domain: {domain}'}, 404
-
-            try:
-                summary = deploy_manager.run_manual_deploy(domain)
-            except Exception as e:
-                logger.error(f"Manual deploy hook run failed for {domain}: {e}")
-                return {'error': 'Manual deploy hook run failed'}, 500
-
-            event_bus = current_app.config.get('EVENT_BUS')
-            if event_bus:
-                event_bus.publish('certificate_deploy_manual', {
-                    'domain': domain,
-                    'ok': summary.get('ok'),
-                    'total': summary.get('total'),
-                    'succeeded': summary.get('succeeded'),
-                    'failed': summary.get('failed'),
-                })
-
-            # 200 even when ok=False (e.g. no hooks configured) so the
-            # client can read the structured summary; the route only
-            # returns non-2xx for path validation / server errors.
-            return summary, 200
 
     # Backup endpoints (Unified backup system for atomic consistency)
     class BackupList(Resource):
@@ -941,24 +829,37 @@ def create_api_resources(api, models, managers):
                 if backend_type not in valid_backends:
                     return {'error': 'Invalid backend type'}, 400
 
-                # Build only the storage subtree and merge atomically so we
-                # don't race with concurrent writes or wipe other settings keys.
-                current = settings_manager.load_settings()
-                storage = dict(current.get('certificate_storage') or {})
-                storage['backend'] = backend_type
+                settings = settings_manager.load_settings()
 
+                # Update storage configuration
+                if 'certificate_storage' not in settings:
+                    settings['certificate_storage'] = {}
+
+                settings['certificate_storage']['backend'] = backend_type
+
+                # Update backend-specific configuration
                 if backend_type == 'local_filesystem':
-                    storage['cert_dir'] = data.get('cert_dir', 'certificates')
-                elif backend_type == 'azure_keyvault':
-                    storage['azure_keyvault'] = data.get('azure_keyvault', {})
-                elif backend_type == 'aws_secrets_manager':
-                    storage['aws_secrets_manager'] = data.get('aws_secrets_manager', {})
-                elif backend_type == 'hashicorp_vault':
-                    storage['hashicorp_vault'] = data.get('hashicorp_vault', {})
-                elif backend_type == 'infisical':
-                    storage['infisical'] = data.get('infisical', {})
+                    cert_dir = data.get('cert_dir', 'certificates')
+                    settings['certificate_storage']['cert_dir'] = cert_dir
 
-                success = settings_manager.atomic_update({'certificate_storage': storage})
+                elif backend_type == 'azure_keyvault':
+                    azure_config = data.get('azure_keyvault', {})
+                    settings['certificate_storage']['azure_keyvault'] = azure_config
+
+                elif backend_type == 'aws_secrets_manager':
+                    aws_config = data.get('aws_secrets_manager', {})
+                    settings['certificate_storage']['aws_secrets_manager'] = aws_config
+
+                elif backend_type == 'hashicorp_vault':
+                    vault_config = data.get('hashicorp_vault', {})
+                    settings['certificate_storage']['hashicorp_vault'] = vault_config
+
+                elif backend_type == 'infisical':
+                    infisical_config = data.get('infisical', {})
+                    settings['certificate_storage']['infisical'] = infisical_config
+
+                # Save settings
+                success = settings_manager.save_settings(settings, backup_reason="storage_backend_update")
 
                 if success:
                     return {
@@ -1195,32 +1096,33 @@ def create_api_resources(api, models, managers):
                             if directory_response.status_code == 200:
                                 try:
                                     directory_data = directory_response.json()
+                                    # Check if it looks like an ACME directory
+                                    if 'newAccount' in directory_data or 'keyChange' in directory_data:
+                                        return {
+                                            'success': True,
+                                            'message': 'ACME endpoint appears valid',
+                                            'ca_provider': ca_provider,
+                                            'acme_url': acme_url,
+                                            'has_ca_cert': bool(ca_cert),
+                                            'urls': list(directory_data.keys()) if directory_data else []
+                                        }
+                                    else:
+                                        return {
+                                            'success': False,
+                                            'message': 'Endpoint does not appear to be a valid ACME directory',
+                                            'ca_provider': ca_provider
+                                        }
                                 except Exception:
                                     return {
                                         'success': False,
                                         'message': 'Endpoint is accessible but returned invalid JSON',
                                         'ca_provider': ca_provider
                                     }
-                                # Check if it looks like an ACME directory
-                                if 'newAccount' in directory_data or 'keyChange' in directory_data:
-                                    return {
-                                        'success': True,
-                                        'message': 'ACME endpoint appears valid',
-                                        'ca_provider': ca_provider,
-                                        'acme_url': acme_url,
-                                        'has_ca_cert': bool(ca_cert),
-                                        'urls': list(directory_data.keys()) if directory_data else []
-                                    }
                                 return {
                                     'success': False,
-                                    'message': 'Endpoint does not appear to be a valid ACME directory',
+                                    'message': f'ACME endpoint returned HTTP {directory_response.status_code}',
                                     'ca_provider': ca_provider
                                 }
-                            return {
-                                'success': False,
-                                'message': f'ACME endpoint returned HTTP {directory_response.status_code}',
-                                'ca_provider': ca_provider
-                            }
 
                         except requests.exceptions.Timeout:
                             return {
@@ -1374,11 +1276,8 @@ def create_api_resources(api, models, managers):
         'CacheClear': CacheClear,
         'CertificateList': CertificateList,
         'CreateCertificate': CreateCertificate,
-        'CertificateDetail': CertificateDetail,
         'DownloadCertificate': DownloadCertificate,
         'RenewCertificate': RenewCertificate,
-        'CertificateAutoRenew': CertificateAutoRenew,
-        'CertificateRunDeploy': CertificateRunDeploy,
         'BackupList': BackupList,
         'BackupCreate': BackupCreate,
         'BackupDownload': BackupDownload,
